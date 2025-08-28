@@ -9,6 +9,7 @@ public class Main {
 	private static final ConcurrentHashMap<String, Stream> streams = new ConcurrentHashMap<>();
 	private static final ConcurrentHashMap<String, String> redisKeys = new ConcurrentHashMap<>();
 	private static final ConcurrentHashMap<String, LinkedList<ArrayList<String>>> lists = new ConcurrentHashMap<>();
+	private static final ConcurrentHashMap<String, Queue<PopTicket>> popQueue = new ConcurrentHashMap<>();
 	private static final ZSET zset = new ZSET();
 	private static String masterHost;
 	private static int masterPort;
@@ -860,36 +861,43 @@ public class Main {
 
 			} else if (cmd.equals("BLPOP")) {
 				String key = command.get(1);
-				double timeout = command.size() > 2 ? Double.parseDouble(command.get(2)) : 0;
-				String removed = "";
-				double timestamp = System.currentTimeMillis();
-				double expireDuration = timeout * 1000;
-				synchronized (lists) {
-					while (true) {
-						if (expireDuration != 0 && System.currentTimeMillis() >= timestamp + expireDuration) break;
+				Queue<PopTicket> q = popQueue.get(key);
+				while (true) {
+					if (q.peek().getSocket() == s) break;
+					try {
+						Thread.sleep(100);
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+					}
+				}
+				while (true) {
+					if (q.peek().getExpTime() != 0 && System.currentTimeMillis() >= q.peek().getExpTime()) return "$-1\r\n";
 
-						if (lists.containsKey(key)) {
-							LinkedList<ArrayList<String>> linkList = lists.get(key);
-							if (!linkList.isEmpty()) {
-								ArrayList<String> firstList = linkList.getFirst();
-								if (!firstList.isEmpty()) {
-									removed = firstList.removeFirst();
-									System.out.println("address: " + s.getRemoteSocketAddress());
-									System.out.println("removed: " + removed);
-									break;
-								}
-							}
-						}
-
+					synchronized (lists) {
 						try {
-							Thread.sleep(10);
-						} catch (InterruptedException e) {
-							Thread.currentThread().interrupt();
+							if (lists.containsKey(key)) {
+								LinkedList<ArrayList<String>> linkList = lists.get(key);
+								ArrayList<String> firstList = linkList.getFirst();
+								String removed = firstList.removeFirst();
+								if (firstList.isEmpty()) linkList.removeFirst();
+								if (linkList.isEmpty()) lists.remove(key);
+								q.poll();
+								System.out.println("address: " + s.getRemoteSocketAddress());
+								System.out.println("removed: " + removed);
+								return "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
+							}
+						} catch (RuntimeException e) {
+							System.out.println("IOException: " + e.getMessage());
 						}
+					}
+
+					try {
+						Thread.sleep(10);
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
 					}
 				}
 
-				return "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
 			} else if (cmd.equals("LLEN")) {
 				String key = command.get(1);
 				if (!lists.containsKey(key)) return ":0\r\n";
@@ -1042,12 +1050,26 @@ public class Main {
 					List<String> command = parseRESP(in);
 					if (command != null && !command.isEmpty()) {
 						String cmd = command.get(0).toUpperCase();
+
 						if (isSubMode(socket) && !subModeCmds.contains(cmd)) {
 							String resp = "-ERR Can't execute '" + cmd + "' in subscribed mode\r\n";
 							out.write(resp);
 							out.flush();
 							continue;
 						}
+
+						if (cmd.equals("BLPOP")) {
+							synchronized (popQueue) {
+								String key = command.get(1);
+								double timeout = command.size() > 2 ? Double.parseDouble(command.get(2)) : 0;
+								double expireDuration = timeout * 1000;
+								double expTime = timeout == 0 ? 0 : System.currentTimeMillis()+expireDuration;
+								popQueue.putIfAbsent(key, new LinkedList<>());
+								popQueue.get(key).offer(new PopTicket(socket, expTime));
+							}
+						}
+
+
 						if  (cmd.equals("UNSUBSCRIBE")) {
 							String channel = command.get(1);
 							synchronized (channelToSubs) {
