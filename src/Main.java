@@ -1,15 +1,21 @@
 import java.io.*;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class Main {
-	private static final ConcurrentHashMap<String, String[]> map = new ConcurrentHashMap<>();
-	private static final ConcurrentHashMap<String, Stream> streams = new ConcurrentHashMap<>();
-	private static final ConcurrentHashMap<String, String> redisKeys = new ConcurrentHashMap<>();
-	private static final ConcurrentHashMap<String, LinkedList<ArrayList<String>>> lists = new ConcurrentHashMap<>();
-	private static final ConcurrentHashMap<String, Queue<PopTicket>> popQueue = new ConcurrentHashMap<>();
+	private static final HashMap<String, String[]> map = new HashMap<>();
+	private static final HashMap<String, Stream> streams = new HashMap<>();
+	private static final HashMap<String, String> redisKeys = new HashMap<>();
+	private static final HashMap<String, LinkedList<ArrayList<String>>> lists = new HashMap<>();
 	private static final ZSET zset = new ZSET();
 	private static String masterHost;
 	private static int masterPort;
@@ -19,20 +25,24 @@ public class Main {
 	private static long replica_repl_offset = 0;
 	private static boolean isReplica = false;
 	private static final Set<String> writeCmds = new HashSet<>(Arrays.asList("SET", "INCR"));
-	private static final Set<BufferedWriter> replicaWriters = Collections.synchronizedSet(new HashSet<>());
-	private static final ConcurrentHashMap<Socket, Long> replicaOffsets = new ConcurrentHashMap<>();
+	private static final Set<SelectionKey> replicaWriters = new HashSet<>();
+	private static final ConcurrentHashMap<SocketChannel, Long> replicaOffsets = new ConcurrentHashMap<>();
 	private static String dir;
 	private static String dbfilename;
-	private static final ConcurrentHashMap<String, Set<Socket>> channelToSubs = new ConcurrentHashMap<>();
-	private static final ConcurrentHashMap<Socket, Set<String>> subToChannels = new ConcurrentHashMap<>();
+	private static final HashMap<String, Set<SelectionKey>> channelToSubs = new HashMap<>();
+	private static final HashMap<SelectionKey, Set<String>> subToChannels = new HashMap<>();
 	private static final Set<String> subModeCmds = new HashSet<>(Arrays.asList("SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT"));
+	private static final Set<SocketChannel> clients = new HashSet<>();
+	private static final HashMap<SelectionKey, MultiHandler> multiHandlers = new HashMap<>();
+	private static final ConcurrentHashMap<String, Queue<ClientRequest>> waitingQueue = new ConcurrentHashMap<>();
+	private static ConcurrentLinkedQueue<StreamRequest> streamWaitQueue = new ConcurrentLinkedQueue<>();
+	private static final ConcurrentLinkedQueue<AckRequest> ackWaitQueue = new ConcurrentLinkedQueue<>();
+	private static final HashMap<String, List<Geo>> geo = new HashMap<>();
 
 	public static void main(String[] args) {
 		// You can use print statements as follows for debugging, they'll be visible when running tests.
 		System.out.println("Logs from your program will appear here!");
 
-		ServerSocket serverSocket = null;
-		Socket clientSocket = null;
 		int port = 6379;
 		try {
 			// Parse command-line arguments
@@ -56,21 +66,399 @@ public class Main {
 				loadRDB();
 			}
 
+			// Code block - event loop set up
+			Selector selector = Selector.open();
+			ServerSocketChannel ssc = ServerSocketChannel.open();
+			ssc.configureBlocking(false);
+			ssc.bind(new InetSocketAddress(port));
+			ssc.register(selector, SelectionKey.OP_ACCEPT);
+
 			if (isReplica) {
 				new Thread(new MasterConnectionHandler(masterHost, masterPort)).start();
 			}
 
-			serverSocket = new ServerSocket(port);
-			// Since the tester restarts your program quite often, setting SO_REUSEADDR
-			// ensures that we don't run into 'Address already in use' errors
-			serverSocket.setReuseAddress(true);
+			new Thread(new WaitingQueueHandler()).start();
+			new Thread(new StreamWaitingQueueHandler()).start();
+			new Thread(new AckWaitingQueueHandler()).start();
 
-			// Handle multiple connections
-			while(true){
-				clientSocket = serverSocket.accept();
-				new Thread(new ClientHandler(clientSocket, isReplica)).start();
+			// Start listening to connections
+			while (true) {
+				try {
+					selector.select();
+					Set<SelectionKey> keys = selector.selectedKeys();
+					Iterator<SelectionKey> it = keys.iterator();
+					while (it.hasNext()) {
+						SelectionKey key = it.next();
+						if (key.isAcceptable()) {
+							acceptConnection(selector, key);
+						} else if (key.isReadable()) {
+							readCommand(key);
+						}
+						it.remove();
+					}
+				} catch (IOException e) {
+					throw new RuntimeException("-ERR connection error");
+				}
+			}
+
+		} catch (IOException e) {
+			System.out.println("IOException: " + e.getMessage());
+		} finally {
+			try {
+				for (SocketChannel channel : clients) {
+					channel.close();
+				}
+			} catch (IOException e) {
+				System.out.println("IOException: " + e.getMessage());
+			}
+		}
+	}
+
+	static class MasterConnectionHandler implements Runnable {
+
+		private final String host;
+		private final int port;
+
+		MasterConnectionHandler(String host, int port) {
+			this.host = host;
+			this.port = port;
+		}
+
+		public void run() {
+			try (Socket masterSocket = new Socket(host, port)) {
+				InputStream in = masterSocket.getInputStream();
+				OutputStream out = masterSocket.getOutputStream();
+				String resp = "*1\r\n$4\r\nPING\r\n";
+				out.write(resp.getBytes());
+				out.flush();
+				readLine(in);
+
+				String listeningPort =
+						"*3\r\n" +
+								"$8\r\nREPLCONF\r\n" +
+								"$14\r\nlistening-port\r\n" +
+								"$" + String.valueOf(replicaPort).length() + "\r\n" + replicaPort + "\r\n";
+				out.write(listeningPort.getBytes());
+				out.flush();
+				readLine(in);
+
+				String capa =
+						"*3\r\n" +
+								"$8\r\nREPLCONF\r\n" +
+								"$4\r\ncapa\r\n" +
+								"$6\r\npsync2\r\n";
+				out.write(capa.getBytes());
+				out.flush();
+				readLine(in);
+
+				String psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+				out.write(psync.getBytes());
+				out.flush();
+				String fullresync = readLine(in);
+
+				String lenLine = readLine(in);
+				int len = Integer.parseInt(lenLine.substring(1));
+				byte[] rdb = new byte[len];
+				int read = 0;
+				while (read < len) {
+					int n = in.read(rdb, read, len - read);
+					if (n <= 0) throw new IOException("Failed to read RDB");
+					read += n;
+				}
+
+				while (true) {
+					List<String> command = parseRESP(in);
+					if (command == null || command.isEmpty()) continue;
+					String cmd = command.get(0).toUpperCase();
+					if (cmd.equals("REPLCONF") && command.size() > 1 && command.get(1).equalsIgnoreCase("GETACK")) {
+						String ack = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n";
+						String offset = String.valueOf(replica_repl_offset);
+						ack += "$" + offset.length() + "\r\n" + offset + "\r\n";
+						out.write(ack.getBytes());
+						out.flush();
+					} else {
+						execCommand(command, null, null);
+					}
+					replica_repl_offset += getResp(command).getBytes().length;
+				}
+			} catch (IOException e) {
+				System.out.println("IOException: " + e.getMessage());
+			}
+		}
+	}
+
+	private static String readLine(InputStream in) throws IOException {
+		ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		while (true) {
+			int b = in.read();
+			if (b == -1) {
+				if (baos.size() == 0) return null;
+				throw new EOFException("Unexpected EOF while reading line");
+			}
+			if (b == '\r') {
+				int next = in.read();
+				if (next == -1) {
+					throw new EOFException();
+				}
+				if (next == '\n') {
+					break;
+				}
+				baos.write(b);
+				baos.write(next);
+				continue;
+			}
+			baos.write(b);
+		}
+		return new String(baos.toByteArray(), "UTF-8");
+	}
+
+	private static List<String> parseRESP(InputStream in) throws IOException {
+		String firstLine = readLine(in);
+		if (firstLine == null) return null;
+
+		if (firstLine.startsWith("*")) {
+			int argCount = Integer.parseInt(firstLine.substring(1));
+			List<String> args = new ArrayList<>();
+			for (int i = 0; i < argCount; i++) {
+				String lenLine = readLine(in);
+				if (!lenLine.startsWith("$")) {
+					throw new IOException("Invalid bulk string length line: " + lenLine);
+				}
+				int length = Integer.parseInt(lenLine.substring(1));
+				if (length == -1) {
+					args.add(null);
+					readLine(in); // \r\n
+					continue;
+				}
+				byte[] buf = new byte[length];
+				int r = 0;
+				while (r < length) {
+					int n = in.read(buf, r, length - r);
+					if (n <= 0) throw new IOException("Failed to read bulk string");
+					r += n;
+				}
+				args.add(new String(buf, "UTF-8"));
+				String crlf = readLine(in);
+				if (!crlf.isEmpty()) {
+					throw new IOException("Expected \r\n after bulk string");
+				}
+			}
+			return args;
+		} else {
+			throw new IOException("Invalid RESP input: " + firstLine);
+		}
+	}
+
+
+	private static void acceptConnection(Selector selector, SelectionKey key) {
+		try {
+			ServerSocketChannel ssc = (ServerSocketChannel) key.channel();
+			SocketChannel client = ssc.accept();
+			client.configureBlocking(false);
+			client.register(selector, SelectionKey.OP_READ);
+			clients.add(client);
+		} catch (IOException e) {
+			System.out.println("IOException: " + e.getMessage());
+		}
+	}
+
+	private static void writeResponseToClient (String resp, SelectionKey key) {
+		SocketChannel client = (SocketChannel) key.channel();
+		try {
+			ByteBuffer response = ByteBuffer.wrap(resp.getBytes(StandardCharsets.UTF_8));
+			while (response.hasRemaining()) {
+				client.write(response);
 			}
 		} catch (IOException e) {
+			try {
+				clients.remove(client);
+				client.close();
+				key.cancel();
+			} catch (IOException ignored) {}
+			System.out.println("IOException: " + e.getMessage());
+		}
+
+	}
+
+	private static void readCommand(SelectionKey key) {
+		SocketChannel client = (SocketChannel) key.channel();
+		try {
+			StringBuilder sb = (StringBuilder) key.attachment();
+			if (sb == null) {
+				sb = new StringBuilder();
+				key.attach(sb);
+			}
+			ByteBuffer buffer = ByteBuffer.allocate(1024);
+
+			int bytesRead = client.read(buffer);
+			if (bytesRead == -1) {
+				clients.remove(client);
+				key.cancel();
+				client.close();
+				return;
+			}
+
+			if (bytesRead > 0) {
+				buffer.flip();
+				byte[] bytes = new byte[buffer.remaining()];
+				buffer.get(bytes);
+				String msg = new String(bytes, StandardCharsets.UTF_8);
+				sb.append(msg);
+				buffer.clear();
+
+				while (true) {
+					List<String> command = parseRESP(sb);
+					System.out.println("command being read: " + command);
+					if (command != null && !command.isEmpty()) {
+						String cmd = command.get(0).toUpperCase();
+
+						if (isSubMode(key) && !subModeCmds.contains(cmd)) {
+							String resp = "-ERR Can't execute '" + cmd + "' in subscribed mode\r\n";
+							writeResponseToClient(resp, key);
+							continue;
+						}
+
+
+						if  (cmd.equals("UNSUBSCRIBE")) {
+							String channel = command.get(1);
+
+							if (channelToSubs.containsKey(channel)) {
+								channelToSubs.get(channel).remove(key);
+								if  (channelToSubs.get(channel).isEmpty()) {
+									channelToSubs.remove(channel);
+								}
+							}
+
+
+							if (subToChannels.containsKey(key)) {
+								subToChannels.get(key).remove(channel);
+								if  (subToChannels.get(key).isEmpty()) {
+									subToChannels.remove(key);
+								}
+							}
+							int channelCount = subToChannels.containsKey(key) ? subToChannels.get(key).size() : 0;
+							String resp = "*3"+ "\r\n" + "$11" + "\r\n" + "unsubscribe" + "\r\n";
+							resp += "$" + channel.length() + "\r\n" + channel + "\r\n";
+							resp += ":" + channelCount + "\r\n";
+							writeResponseToClient(resp, key);
+						} else if  (cmd.equals("SUBSCRIBE")) {
+							String channel = command.get(1);
+							channelToSubs.putIfAbsent(channel, new HashSet<>());
+							channelToSubs.get(channel).add(key);
+
+							subToChannels.putIfAbsent(key, new HashSet<>());
+							subToChannels.get(key).add(channel);
+
+							int channelCount = subToChannels.get(key).size();
+							String resp = "*3"+ "\r\n" + "$9" + "\r\n" + "subscribe" + "\r\n";
+							resp += "$" + channel.length() + "\r\n" + channel + "\r\n";
+							resp += ":" + channelCount + "\r\n";
+							writeResponseToClient(resp, key);
+						} else if (cmd.equals("CONFIG")) {
+							if (command.size() == 3 && command.get(1).equalsIgnoreCase("get") && command.get(2).equalsIgnoreCase("dir")) {
+								String dirValue = dir != null ? dir : "";
+								String resp = "*2\r\n$3\r\ndir\r\n$" + dirValue.length() + "\r\n" + dirValue + "\r\n";
+								writeResponseToClient(resp, key);
+							}
+						} else if (cmd.equals("PSYNC")) {
+							String resp = "+FULLRESYNC " + master_replid + " " + master_repl_offset + "\r\n";
+							writeResponseToClient(resp, key);
+
+							byte[] rdb = new RDB().getRDB();
+							String lengthHeader = "$" + rdb.length + "\r\n";
+							writeResponseToClient(lengthHeader, key);
+							ByteBuffer bb = ByteBuffer.wrap(rdb);
+							while (bb.hasRemaining()) {
+								client.write(bb);
+							}
+						} else if (cmd.equals("REPLCONF")) {
+							boolean sendOk = true;
+							if (command.size() > 2 && command.get(1).toUpperCase().equals("ACK")) {
+								long offset = Long.parseLong(command.get(2));
+								System.out.println("setting offset after replica send ack message: " + client);
+								System.out.println("offset: " + offset);
+								replicaOffsets.put(client, offset);
+								sendOk = false;
+							}
+							if (sendOk) {
+								String resp = "+OK\r\n";
+								writeResponseToClient(resp, key);
+							}
+							if (command.size() > 2 && command.get(1).equalsIgnoreCase("listening-port")) {
+								replicaWriters.add(key);
+							}
+						} else if (cmd.equals("INFO")) {
+							if (command.get(1).equalsIgnoreCase("replication")) {
+								String role = isReplica ? "slave" : "master";
+								String infoRepl = "+role:" + role + "\r\n" + "+master_replid:" + master_replid + "\r\n" + "+master_repl_offset:" + master_repl_offset + "\r\n";
+								String resp = "$" + infoRepl.length() + "\r\n" + infoRepl + "\r\n";
+								writeResponseToClient(resp, key);
+							}
+						} else if (cmd.equals("MULTI")) {
+							System.out.println("Selection key: " + key);
+							multiHandlers.putIfAbsent(key, new MultiHandler());
+							multiHandlers.get(key).init();
+							String resp = "+OK\r\n";
+							writeResponseToClient(resp, key);
+						} else if (cmd.equals("DISCARD")) {
+							if (!multiHandlers.containsKey(key) || !multiHandlers.get(key).isOn()) {
+								writeResponseToClient("-ERR DISCARD without MULTI\r\n", key);
+							} else {
+								multiHandlers.get(key).clear();
+								writeResponseToClient("+OK\r\n", key);
+							}
+						} else if (cmd.equals("EXEC")) {
+							if (!multiHandlers.containsKey(key) || !multiHandlers.get(key).isOn()) {
+								writeResponseToClient("-ERR EXEC without MULTI\r\n", key);
+							} else if (multiHandlers.get(key).isEmpty()) {
+								multiHandlers.get(key).clear();
+								writeResponseToClient("*0\r\n", key);
+							} else {
+								String resp = "*" + multiHandlers.get(key).getSize() + "\r\n";
+								while (!multiHandlers.get(key).isEmpty()) {
+									List<String> args = multiHandlers.get(key).getNext();
+									String res = execCommand(args, client, key);
+									if (res == null) {
+										throw new IOException("unknown command: " + command);
+									} else {
+										resp += res;
+									}
+								}
+								writeResponseToClient(resp, key);
+								multiHandlers.get(key).clear();
+							}
+						} else {
+							if (multiHandlers.containsKey(key) && multiHandlers.get(key).isOn()) {
+								multiHandlers.get(key).add(command);
+								writeResponseToClient("+QUEUED\r\n", key);
+							} else {
+								String resp = execCommand(command, client, key);
+								System.out.println("result: " + resp);
+								if (resp == null) throw new IOException("unknown command: " + command);
+								if (resp.equals("wait")) break;
+								writeResponseToClient(resp, key);
+							}
+						}
+						if (writeCmds.contains(cmd)) {
+							String resp = getResp(command);
+							master_repl_offset += resp.getBytes().length;
+							for (SelectionKey skey : replicaWriters) {
+								writeResponseToClient(resp, skey);
+							}
+						}
+					} else break;
+				}
+			}
+
+		} catch (IOException e) {
+			try	{
+				replicaWriters.remove(key);
+				replicaOffsets.remove(client);
+
+				clients.remove(client);
+				key.cancel();
+				client.close();
+			} catch (IOException ignored) {}
 			System.out.println("IOException: " + e.getMessage());
 		}
 	}
@@ -250,138 +638,188 @@ public class Main {
 				((bytes[1] & 0xFFL) << 8) | (bytes[0] & 0xFFL);
 	}
 
-	static class MasterConnectionHandler implements Runnable {
+	static class AckWaitingQueueHandler implements Runnable {
+		public void run() {
+			while (true) {
+				synchronized (ackWaitQueue) {
+					ConcurrentLinkedQueue<AckRequest> nextq = new ConcurrentLinkedQueue<>();
+					while (!ackWaitQueue.isEmpty()) {
+						AckRequest ackr = ackWaitQueue.poll();
+						SelectionKey skey = ackr.getSkey();
+						long exp = ackr.getExp();
+						int requiredAckCount = ackr.getRequiredCount();
 
-		private final String host;
-		private final int port;
+						// Enumerate ack count
+						int ackCount = 0;
+						for (long offset : replicaOffsets.values()) {
+							if (offset >= master_repl_offset) ackCount++;
+						}
 
-		MasterConnectionHandler(String host, int port) {
-			this.host = host;
-			this.port = port;
+						if (ackCount >= requiredAckCount || System.currentTimeMillis() >= exp) {
+							String resp = ":" + ackCount + "\r\n";
+							writeResponseToClient(resp, skey);
+						} else {
+							nextq.offer(ackr);
+						}
+					}
+					ackWaitQueue.addAll(nextq);
+				}
+				try {
+					Thread.sleep(10);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
 		}
+	}
+
+	static class StreamWaitingQueueHandler implements Runnable {
 
 		public void run() {
-			try (Socket masterSocket = new Socket(host, port)) {
-				InputStream in = masterSocket.getInputStream();
-				OutputStream out = masterSocket.getOutputStream();
-				String resp = "*1\r\n$4\r\nPING\r\n";
-				out.write(resp.getBytes());
-				out.flush();
-				readLine(in);
+			while (true) {
+				synchronized (streamWaitQueue) {
+					ConcurrentLinkedQueue<StreamRequest> nextQ = new ConcurrentLinkedQueue<>();
+					while (!streamWaitQueue.isEmpty()) {
+						StreamRequest sr = streamWaitQueue.poll();
+						long exp = sr.getExp();
+						SelectionKey skey = sr.getSelectKey();
+						if (exp != 0 && System.currentTimeMillis() >= exp) {
+							writeResponseToClient("*-1\r\n", skey);
+							continue;
+						}
+						List<String> keys = sr.getStreamKeys();
+						int size = sr.getSize();
+						int[] sentinels = sr.getSentinels();
+						String resp = "";
+						int count = 0;
+						for (int i = 0; i < size; i++) {
+							String key = keys.get(i);
+							String hashResp = "*2\r\n";
+							hashResp += "$" + key.length() + "\r\n" + key + "\r\n";
+							hashResp += "*1\r\n" + "*2\r\n";
+							String entryHash = streams.get(key).getNewEntries(sentinels[i]+1);
+							if (!entryHash.isEmpty()) {
+								resp += (hashResp + entryHash);
+								count++;
+							}
+						}
 
-				String listeningPort =
-						"*3\r\n" +
-								"$8\r\nREPLCONF\r\n" +
-								"$14\r\nlistening-port\r\n" +
-								"$" + String.valueOf(replicaPort).length() + "\r\n" + replicaPort + "\r\n";
-				out.write(listeningPort.getBytes());
-				out.flush();
-				readLine(in);
+						if (count > 0) {
+							resp = "*" + count + "\r\n" + resp;
+							writeResponseToClient(resp, skey);
+						} else {
+							nextQ.offer(sr);
+						}
 
-				String capa =
-						"*3\r\n" +
-								"$8\r\nREPLCONF\r\n" +
-								"$4\r\ncapa\r\n" +
-								"$6\r\npsync2\r\n";
-				out.write(capa.getBytes());
-				out.flush();
-				readLine(in);
-
-				String psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
-				out.write(psync.getBytes());
-				out.flush();
-				String fullresync = readLine(in);
-
-				String lenLine = readLine(in);
-				int len = Integer.parseInt(lenLine.substring(1));
-				byte[] rdb = new byte[len];
-				int read = 0;
-				while (read < len) {
-					int n = in.read(rdb, read, len - read);
-					if (n <= 0) throw new IOException("Failed to read RDB");
-					read += n;
-				}
-
-				while (true) {
-					List<String> command = parseRESP(in);
-					if (command == null || command.isEmpty()) continue;
-					String cmd = command.get(0).toUpperCase();
-					if (cmd.equals("REPLCONF") && command.size() > 1 && command.get(1).equalsIgnoreCase("GETACK")) {
-						String ack = "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n";
-						String offset = String.valueOf(replica_repl_offset);
-						ack += "$" + offset.length() + "\r\n" + offset + "\r\n";
-						out.write(ack.getBytes());
-						out.flush();
-					} else {
-						execCommand(command, null);
 					}
-					replica_repl_offset += getResp(command).getBytes().length;
+					streamWaitQueue.addAll(nextQ);
+
 				}
-			} catch (IOException e) {
-				System.out.println("IOException: " + e.getMessage());
+
+				try {
+					Thread.sleep(10);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
 			}
 		}
 	}
 
-	private static String readLine(InputStream in) throws IOException {
-		ByteArrayOutputStream baos = new ByteArrayOutputStream();
-		while (true) {
-			int b = in.read();
-			if (b == -1) {
-				if (baos.size() == 0) return null;
-				throw new EOFException("Unexpected EOF while reading line");
-			}
-			if (b == '\r') {
-				int next = in.read();
-				if (next == -1) {
-					throw new EOFException();
+	static class WaitingQueueHandler implements Runnable {
+
+		public void run() {
+			while (true) {
+				synchronized (waitingQueue) {
+					for (String key : waitingQueue.keySet()) {
+						Queue<ClientRequest> q = waitingQueue.get(key);
+						if (q.isEmpty()) {
+							waitingQueue.remove(key);
+							continue;
+						}
+						while (!q.isEmpty()) {
+							ClientRequest req = q.peek();
+							SelectionKey skey = req.getKey();
+							long exp = req.getExpiryTime();
+							if (exp != 0 && System.currentTimeMillis() >= exp) {
+								q.poll();
+								writeResponseToClient("*-1\r\n", skey);
+								skey.interestOps(SelectionKey.OP_READ);
+							}
+							break;
+						}
+					}
 				}
-				if (next == '\n') {
-					break;
+				try {
+					Thread.sleep(10);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
 				}
-				baos.write(b);
-				baos.write(next);
-				continue;
 			}
-			baos.write(b);
 		}
-		return new String(baos.toByteArray(), "UTF-8");
 	}
 
-	private static List<String> parseRESP(InputStream in) throws IOException {
-		String firstLine = readLine(in);
-		if (firstLine == null) return null;
+	// Parse RESP from the buffer, return null if incomplete
+	private static List<String> parseRESP(StringBuilder sb) {
+		if (sb.isEmpty())
+			return null;
 
-		if (firstLine.startsWith("*")) {
-			int argCount = Integer.parseInt(firstLine.substring(1));
-			List<String> args = new ArrayList<>();
-			for (int i = 0; i < argCount; i++) {
-				String lenLine = readLine(in);
-				if (!lenLine.startsWith("$")) {
-					throw new IOException("Invalid bulk string length line: " + lenLine);
+		if (sb.charAt(0) == '*') {
+			int lineEnd = sb.indexOf("\r\n");
+			if (lineEnd == -1)
+				return null;
+
+			int numElements;
+			try {
+				numElements = Integer.parseInt(sb.substring(1, lineEnd));
+			} catch (NumberFormatException e) {
+				return null; // malformed header
+			}
+
+			List<String> parts = new ArrayList<>();
+			int pos = lineEnd + 2;
+
+			for (int i = 0; i < numElements; i++) {
+				if (pos >= sb.length() || sb.charAt(pos) != '$')
+					return null;
+
+				int lenEnd = sb.indexOf("\r\n", pos);
+				if (lenEnd == -1)
+					return null;
+
+				int bulkLen;
+				try {
+					bulkLen = Integer.parseInt(sb.substring(pos + 1, lenEnd));
+				} catch (NumberFormatException e) {
+					return null;
 				}
-				int length = Integer.parseInt(lenLine.substring(1));
-				if (length == -1) {
-					args.add(null);
-					readLine(in); // \r\n
+				pos = lenEnd + 2;
+
+				if (bulkLen < 0) {
+					// NULL bulk string ($-1), represent as null
+					parts.add(null);
 					continue;
 				}
-				byte[] buf = new byte[length];
-				int r = 0;
-				while (r < length) {
-					int n = in.read(buf, r, length - r);
-					if (n <= 0) throw new IOException("Failed to read bulk string");
-					r += n;
-				}
-				args.add(new String(buf, "UTF-8"));
-				String crlf = readLine(in);
-				if (!crlf.isEmpty()) {
-					throw new IOException("Expected \r\n after bulk string");
-				}
+
+				if (pos + bulkLen + 2 > sb.length())
+					return null; // not all bytes arrived yet
+
+				String bulkStr = sb.substring(pos, pos + bulkLen);
+				parts.add(bulkStr);
+
+				pos += bulkLen + 2; // skip bulk data and trailing \r\n
 			}
-			return args;
+
+			sb.delete(0, pos); // remove parsed command
+			return parts;
 		} else {
-			throw new IOException("Invalid RESP input: " + firstLine);
+			// Inline command (like "PING\r\n")
+			int lineEnd = sb.indexOf("\r\n");
+			if (lineEnd == -1)
+				return null;
+			String line = sb.substring(0, lineEnd).trim();
+			sb.delete(0, lineEnd + 2);
+			if (line.isEmpty()) return Collections.emptyList();
+			return Arrays.asList(line.split("\\s+"));
 		}
 	}
 
@@ -424,8 +862,8 @@ public class Main {
 		}
 	}
 
-	private static boolean isSubMode(Socket s) {
-		return subToChannels.containsKey(s);
+	private static boolean isSubMode(SelectionKey skey) {
+		return subToChannels.containsKey(skey);
 	}
 
 	private static int getListSize(LinkedList<ArrayList<String>> linkList) {
@@ -437,7 +875,7 @@ public class Main {
 		return entryCount;
 	}
 
-	private static String execCommand(List<String> command, Socket s) {
+	private static String execCommand(List<String> command, SocketChannel s, SelectionKey selectKey) {
 
 		try {
 			String cmd = command.get(0).toUpperCase();
@@ -445,21 +883,19 @@ public class Main {
 				String channel = command.get(1);
 				String msg = command.get(2);
 				int subCount = 0;
-				synchronized (channelToSubs) {
-					Set<Socket> channels = channelToSubs.get(channel);
-					String resp = "*3\r\n$7\r\nmessage\r\n";
-					resp += "$" + channel.length() + "\r\n" + channel + "\r\n";
-					resp += "$" + msg.length() + "\r\n" + msg + "\r\n";
-					for  (Socket socket : channels) {
-						OutputStream os = socket.getOutputStream();
-						os.write(resp.getBytes());
-						os.flush();
-					}
-					subCount = channelToSubs.get(channel).size();
+
+				Set<SelectionKey> channels = channelToSubs.get(channel);
+				String resp = "*3\r\n$7\r\nmessage\r\n";
+				resp += "$" + channel.length() + "\r\n" + channel + "\r\n";
+				resp += "$" + msg.length() + "\r\n" + msg + "\r\n";
+				for  (SelectionKey skey : channels) {
+					writeResponseToClient(resp, skey);
 				}
+				subCount = channelToSubs.get(channel).size();
+
 				return ":" + subCount + "\r\n";
 			} else if (cmd.equals("PING")) {
-				if (s != null && isSubMode(s)) {
+				if (s != null && isSubMode(selectKey)) {
 					String payload = command.size() > 1 ? command.get(1) : null;
 					String resp = "*2" + "\r\n" + "$4\r\n" + "pong" + "\r\n";
 					resp += payload == null ? "$0\r\n\r\n" : "$" + payload.length() + "\r\n" + payload + "\r\n";
@@ -654,6 +1090,7 @@ public class Main {
 					return streams.get(key).getEntriesRange(start, end);
 				}
 			} else if (cmd.equals("XREAD")) {
+				System.out.println("xread command: " + command);
 				long timestamp = System.currentTimeMillis();
 				int n = command.size();
 				int i = 1;
@@ -689,96 +1126,93 @@ public class Main {
 					sentinels[k] = streams.get(key).getSentinelXreadBlock(leftRange);
 				}
 
-				if (blockTime == 0) {
+				if (blockTime >= 0) {
 					String resp = "";
 					int count = 0;
-					while (count == 0) {
-						synchronized (streams) {
-							for (i = 0; i < size; i++) {
-								String key = keys.get(i);
-								String hashResp = "*2\r\n";
-								hashResp += "$" + key.length() + "\r\n" + key + "\r\n";
-								hashResp += "*1\r\n" + "*2\r\n";
-								System.out.println("sentinel: " + sentinels[i]);
-								String entryHash = streams.get(key).getNewEntries(sentinels[i]+1, 1);
-								if (!entryHash.isEmpty()) {
-									resp = "*1\r\n";
-									resp += (hashResp + entryHash);
-									count++;
-									break;
-								}
-							}
+					for (i = 0; i < size; i++) {
+						String key = keys.get(i);
+						String hashResp = "*2\r\n";
+						hashResp += "$" + key.length() + "\r\n" + key + "\r\n";
+						hashResp += "*1\r\n" + "*2\r\n";
+						String entryHash = streams.get(key).getNewEntries(sentinels[i]+1);
+						if (!entryHash.isEmpty()) {
+							resp += (hashResp + entryHash);
+							count++;
 						}
-						if (count == 1) break;
-						try {
-							Thread.sleep(10);
-						} catch (InterruptedException e) {
-							Thread.currentThread().interrupt();
-						}
+					}
+
+					if (count > 0) {
+						return "*" + count + "\r\n" + resp;
+					}
+
+					if (blockTime != 0 && System.currentTimeMillis() >= timestamp+blockTime) {
+						return "*-1\r\n";
+					}
+
+					synchronized (streamWaitQueue) {
+						long expTime = blockTime == 0 ? 0 : (timestamp+blockTime);
+						streamWaitQueue.offer(new StreamRequest(expTime, selectKey, keys, leftRanges, sentinels));
+						return "wait";
+					}
+
+				} else {
+					String resp = "*" + keyCount + "\r\n";
+					for (i = 0; i < size; i++) {
+						String key = keys.get(i);
+						resp += "*2\r\n";
+						resp += "$" + key.length() + "\r\n" + key + "\r\n";
+						resp += "*1\r\n" + "*2\r\n";
+						String leftRange = leftRanges.get(i);
+						resp += streams.get(key).getMultipleStreamsEntries(leftRange, key);
 					}
 					return resp;
-				} else if (blockTime > 0) {
-					String resp = "";
-					while (System.currentTimeMillis() < timestamp + blockTime) {
-						resp = "";
-						synchronized (streams) {
-							int count = 0;
-							for (i = 0; i < size; i++) {
-								String key = keys.get(i);
-								String hashResp = "*2\r\n";
-								hashResp += "$" + key.length() + "\r\n" + key + "\r\n";
-								hashResp += "*1\r\n" + "*2\r\n";
-								String entryHash = streams.get(key).getNewEntries(sentinels[i]+1, -1);
-								if (!entryHash.isEmpty()) {
-									resp += (hashResp + entryHash);
-									count++;
-								}
-							}
-							if (count > 0) resp = "*" + count + "\r\n" + resp;
-						}
-						try {
-							Thread.sleep(10);
-						} catch (InterruptedException e) {
-							Thread.currentThread().interrupt();
-						}
-					}
-					return !resp.isEmpty() ? resp : "$-1\r\n";
-				} else {
-					synchronized (streams) {
-						String resp = "*" + keyCount + "\r\n";
-						for (i = 0; i < size; i++) {
-							String key = keys.get(i);
-							resp += "*2\r\n";
-							resp += "$" + key.length() + "\r\n" + key + "\r\n";
-							resp += "*1\r\n" + "*2\r\n";
-							String leftRange = leftRanges.get(i);
-							resp += streams.get(key).getMultipleStreamsEntries(leftRange, key);
-						}
-						return resp;
-					}
 				}
 			} else if (cmd.equals("RPUSH")) {
 				String key = command.get(1);
-				synchronized (lists) {
-					lists.putIfAbsent(key, new LinkedList<>());
-					LinkedList<ArrayList<String>> linkList = lists.get(key);
-					if (linkList.isEmpty()) linkList.add(new ArrayList<>());
-					ArrayList<String> lastList = linkList.getLast();
 
-					int n = command.size();
+				lists.putIfAbsent(key, new LinkedList<>());
+				LinkedList<ArrayList<String>> linkList = lists.get(key);
+				if (linkList.isEmpty()) linkList.add(new ArrayList<>());
+				ArrayList<String> lastList = linkList.getLast();
 
-					for (int i = 2; i < n; i++) {
-						if (lastList.size() == 100) {
-							lastList = new ArrayList<>();
-							linkList.add(lastList);
-						}
-						lastList.add(command.get(i));
+				int n = command.size();
+
+				for (int i = 2; i < n; i++) {
+					if (lastList.size() == 100) {
+						lastList = new ArrayList<>();
+						linkList.add(lastList);
 					}
-
-					System.out.println("lock is released");
-					return ":" + getListSize(linkList) + "\r\n";
-
+					lastList.add(command.get(i));
 				}
+
+				int entryCount = getListSize(linkList);
+
+				synchronized (waitingQueue) {
+					Queue<ClientRequest> pq = waitingQueue.getOrDefault(key, null);
+					if (pq != null && !pq.isEmpty()) {
+						while (!pq.isEmpty()) {
+							ClientRequest cr = pq.peek();
+							if (cr.getExpiryTime() != 0 && System.currentTimeMillis() >= cr.getExpiryTime()) {
+								pq.poll();
+								writeResponseToClient("$-1\r\n", cr.getKey());
+								cr.getKey().interestOps(SelectionKey.OP_READ);
+							} else {
+								pq.poll();
+								ArrayList<String> firstList = linkList.getFirst();
+								String removed = firstList.removeFirst();
+								if (firstList.isEmpty()) linkList.removeFirst();
+								if (linkList.isEmpty()) lists.remove(key);
+								String resp = "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
+								writeResponseToClient(resp, cr.getKey());
+								cr.getKey().interestOps(SelectionKey.OP_READ);
+								break;
+							}
+						}
+					}
+				}
+
+				return ":" + entryCount + "\r\n";
+
 			} else if (cmd.equals("LPUSH")) {
 				String key = command.get(1);
 				synchronized (lists) {
@@ -861,42 +1295,28 @@ public class Main {
 
 			} else if (cmd.equals("BLPOP")) {
 				String key = command.get(1);
-				Queue<PopTicket> q = popQueue.get(key);
-				while (true) {
-					if (q.peek().getSocket() == s) break;
-					try {
-						Thread.sleep(100);
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-					}
-				}
-				while (true) {
-					if (q.peek().getExpTime() != 0 && System.currentTimeMillis() >= q.peek().getExpTime()) return "$-1\r\n";
+				double timeout = command.size() > 2 ? Double.parseDouble(command.get(2)) : 0;
+				double expireDuration = timeout * 1000;
+				double expTime = timeout == 0 ? 0 : System.currentTimeMillis()+expireDuration;
 
-					synchronized (lists) {
-						try {
-							if (lists.containsKey(key)) {
-								LinkedList<ArrayList<String>> linkList = lists.get(key);
-								ArrayList<String> firstList = linkList.getFirst();
-								String removed = firstList.removeFirst();
-								if (firstList.isEmpty()) linkList.removeFirst();
-								if (linkList.isEmpty()) lists.remove(key);
-								q.poll();
-								System.out.println("address: " + s.getRemoteSocketAddress());
-								System.out.println("removed: " + removed);
-								return "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
-							}
-						} catch (RuntimeException e) {
-							System.out.println("IOException: " + e.getMessage());
-						}
-					}
-
-					try {
-						Thread.sleep(10);
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-					}
+				if (lists.containsKey(key)) {
+					LinkedList<ArrayList<String>> linkList = lists.get(key);
+					ArrayList<String> firstList = linkList.getFirst();
+					String removed = firstList.removeFirst();
+					if (firstList.isEmpty()) linkList.removeFirst();
+					if (linkList.isEmpty()) lists.remove(key);
+					return "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
 				}
+
+				synchronized (waitingQueue) {
+					waitingQueue.putIfAbsent(key, new LinkedList<>());
+
+					waitingQueue.get(key).offer(new ClientRequest(selectKey, (long) expTime));
+				}
+
+				selectKey.interestOps(0);
+
+				return "wait";
 
 			} else if (cmd.equals("LLEN")) {
 				String key = command.get(1);
@@ -948,6 +1368,93 @@ public class Main {
 				}
 				resp = "*" + count + "\r\n" + resp;
 				return resp;
+			} else if (cmd.equals("GEOADD")) {
+				if (command.size() < 5) throw new IllegalArgumentException("GEOADD requires at least 5 commands");
+				String key = command.get(1);
+				double longitude = Double.parseDouble(command.get(2));
+				double latitude = Double.parseDouble(command.get(3));
+				String name = command.get(4);
+				long score = Encode.encode(latitude, longitude);
+				if (Geo.isLongitudeValid(longitude) && Geo.isLatitudeValid(latitude)) {
+					KeySet keySet = new KeySet(name, score);
+					synchronized (zset) {
+						zset.getMemberToScoreMap().putIfAbsent(key, new HashMap<>());
+						zset.getOrderedListOfScores().putIfAbsent(key, new ArrayList<>());
+						if (zset.getMemberToScoreMap().get(key).containsKey(name)) {
+							double oldScore = zset.getMemberToScoreMap().get(key).get(name);
+							zset.getOrderedListOfScores().get(key).remove(new KeySet(name, oldScore));
+							zset.getOrderedListOfScores().get(key).add(keySet);
+							zset.getOrderedListOfScores().get(key).sort(Comparator.comparingDouble(KeySet::getScore).thenComparing(KeySet::getMember));
+							zset.getMemberToScoreMap().get(key).put(name, (double) score);
+							return ":0\r\n";
+						} else {
+							zset.getMemberToScoreMap().get(key).put(name, (double) score);
+							zset.getOrderedListOfScores().get(key).add(keySet);
+							zset.getOrderedListOfScores().get(key).sort(Comparator.comparing(KeySet::getScore).thenComparing(KeySet::getMember));
+							redisKeys.put(key, "zset");
+							return ":1\r\n";
+						}
+					}
+				}
+
+				return "-ERR invalid longitude,latitude pair " + longitude + "," + latitude + "\r\n";
+
+			} else if (cmd.equals("GEOPOS")) {
+				String key = command.get(1);
+				int n = command.size();
+				int count = n-2;
+				String resp = "*" + count + "\r\n";
+				try {
+					HashMap<String, Double> scoreMap = zset.getScoreMap(key);
+					for (int i = 2; i < n; i++) {
+						String place = command.get(i);
+						if (!scoreMap.containsKey(place)) {
+							resp += "*-1\r\n";
+							continue;
+						}
+						double score = scoreMap.get(place);
+						Decode.Coordinates coords = Decode.decode((long) score);
+						String longitude = String.valueOf(coords.longitude);
+						String latitude = String.valueOf(coords.latitude);
+						resp += "*2\r\n";
+						resp += "$" + longitude.length() + "\r\n" + longitude + "\r\n";
+						resp += "$" + latitude.length() + "\r\n" + latitude + "\r\n";
+					}
+					return resp;
+				} catch (Exception e) {
+					resp = "*" + count + "\r\n";
+					while (count > 0) {
+						resp += "*-1\r\n";
+						count--;
+					}
+					return resp;
+				}
+
+			} else if (cmd.equals("GEODIST")) {
+				String key = command.get(1);
+				String place1 = command.get(2);
+				String place2 = command.get(3);
+				try {
+					HashMap<String, Double> scoreMap = zset.getScoreMap(key);
+
+					double score1 = scoreMap.get(place1);
+					Decode.Coordinates coords1 = Decode.decode((long) score1);
+					double long1 = coords1.longitude;
+					double lat1 = coords1.latitude;
+
+					double score2 = scoreMap.get(place2);
+					Decode.Coordinates coords2 = Decode.decode((long) score2);
+					double long2 = coords2.longitude;
+					double lat2 = coords2.latitude;
+
+					String dist = String.valueOf(Geo.geohashGetDistance(long1, lat1, long2, lat2));
+
+					return "$" + dist.length() + "\r\n" + dist + "\r\n";
+
+				} catch (Exception e) {
+					throw new IllegalArgumentException("GEODIST requires at least 1 coordinate pair");
+				}
+
 			} else if (cmd.equals("GET")) {
 				String key = command.get(1);
 				String resp;
@@ -961,39 +1468,33 @@ public class Main {
 				return resp;
 			} else if (cmd.equals("WAIT")) {
 
-				for (BufferedWriter replicaOut : replicaWriters) {
-					String ack = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
-					replicaOut.write(ack);
-					replicaOut.flush();
+				if (master_repl_offset == 0) {
+					return ":" + replicaWriters.size() + "\r\n";
 				}
 
 				int requiredAckCount = Integer.parseInt(command.get(1));
-				int timeLimit = Integer.parseInt(command.get(2));
+				long timeLimit = Integer.parseInt(command.get(2));
 				long startTime = System.currentTimeMillis();
-				int ackCount = 0;
 
-				if (master_repl_offset == 0) {
-					synchronized (replicaWriters) {
-						ackCount = replicaWriters.size();
-					}
-					return ":" + ackCount + "\r\n";
+				int count = 0;
+				for (long offset : replicaOffsets.values()) {
+					if (offset >= master_repl_offset) count++;
 				}
 
-				while (System.currentTimeMillis() - startTime < timeLimit) {
-					synchronized (replicaOffsets) {
-						ackCount = 0;
-						for (long offset : replicaOffsets.values()) {
-							if (offset >= master_repl_offset) ackCount++;
-						}
-						if (ackCount >= requiredAckCount) break;
-					}
-					try {
-						Thread.sleep(10);
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-					}
+				if (timeLimit == 0 || count >= requiredAckCount) {
+					return ":" + count + "\r\n";
 				}
-				return ":" + ackCount + "\r\n";
+
+				for (SelectionKey skey : replicaWriters) {
+					String ack = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+					writeResponseToClient(ack, skey);
+				}
+
+				synchronized (ackWaitQueue) {
+					ackWaitQueue.offer(new AckRequest(requiredAckCount, startTime+timeLimit, selectKey));
+					return "wait";
+				}
+
 			} else if (cmd.equals("KEYS")) {
 				if (command.size() < 2 || !command.get(1).equals("*")) {
 					return "-ERR only KEYS * is supported\r\n";
@@ -1030,192 +1531,4 @@ public class Main {
 		return resp;
 	}
 
-	static class ClientHandler implements Runnable {
-		private Socket socket;
-		private MultiHandler multiHandler;
-		private boolean isReplica;
-		private BufferedWriter out;
-		public ClientHandler(Socket socket, boolean isReplica) {
-			this.socket = socket;
-			this.multiHandler = new MultiHandler();
-			this.isReplica = isReplica;
-		}
-
-		public void run() {
-			try {
-				InputStream in = socket.getInputStream();
-				out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream()));
-				OutputStream os = socket.getOutputStream();
-				while (true) {
-					List<String> command = parseRESP(in);
-					if (command != null && !command.isEmpty()) {
-						String cmd = command.get(0).toUpperCase();
-
-						if (isSubMode(socket) && !subModeCmds.contains(cmd)) {
-							String resp = "-ERR Can't execute '" + cmd + "' in subscribed mode\r\n";
-							out.write(resp);
-							out.flush();
-							continue;
-						}
-
-						if (cmd.equals("BLPOP")) {
-							synchronized (popQueue) {
-								String key = command.get(1);
-								double timeout = command.size() > 2 ? Double.parseDouble(command.get(2)) : 0;
-								double expireDuration = timeout * 1000;
-								double expTime = timeout == 0 ? 0 : System.currentTimeMillis()+expireDuration;
-								popQueue.putIfAbsent(key, new LinkedList<>());
-								popQueue.get(key).offer(new PopTicket(socket, expTime));
-							}
-						}
-
-
-						if  (cmd.equals("UNSUBSCRIBE")) {
-							String channel = command.get(1);
-							synchronized (channelToSubs) {
-								if (channelToSubs.containsKey(channel)) {
-									channelToSubs.get(channel).remove(socket);
-									if  (channelToSubs.get(channel).isEmpty()) {
-										channelToSubs.remove(channel);
-									}
-								}
-							}
-							synchronized (subToChannels) {
-								if (subToChannels.containsKey(socket)) {
-									subToChannels.get(socket).remove(channel);
-									if  (subToChannels.get(socket).isEmpty()) {
-										subToChannels.remove(socket);
-									}
-								}
-							}
-							int channelCount = subToChannels.containsKey(socket) ? subToChannels.get(socket).size() : 0;
-							String resp = "*3"+ "\r\n" + "$11" + "\r\n" + "unsubscribe" + "\r\n";
-							resp += "$" + channel.length() + "\r\n" + channel + "\r\n";
-							resp += ":" + channelCount + "\r\n";
-							out.write(resp);
-							out.flush();
-						} else if  (cmd.equals("SUBSCRIBE")) {
-							String channel = command.get(1);
-							synchronized (channelToSubs) {
-								channelToSubs.putIfAbsent(channel, new HashSet<>());
-								channelToSubs.get(channel).add(socket);
-							}
-							synchronized (subToChannels) {
-								subToChannels.putIfAbsent(socket, new HashSet<>());
-								subToChannels.get(socket).add(channel);
-							}
-							int channelCount = subToChannels.get(socket).size();
-							String resp = "*3"+ "\r\n" + "$9" + "\r\n" + "subscribe" + "\r\n";
-							resp += "$" + channel.length() + "\r\n" + channel + "\r\n";
-							resp += ":" + channelCount + "\r\n";
-							out.write(resp);
-							out.flush();
-						} else if (cmd.equals("CONFIG")) {
-							if (command.size() == 3 && command.get(1).equalsIgnoreCase("get") && command.get(2).equalsIgnoreCase("dir")) {
-								String dirValue = dir != null ? dir : "";
-								String resp = "*2\r\n$3\r\ndir\r\n$" + dirValue.length() + "\r\n" + dirValue + "\r\n";
-								out.write(resp);
-								out.flush();
-							}
-						} else if (cmd.equals("PSYNC")) {
-							out.write("+FULLRESYNC " + master_replid + " " + master_repl_offset + "\r\n");
-							out.flush();
-
-							byte[] rdb = new RDB().getRDB();
-							os.write(("$" + rdb.length + "\r\n").getBytes());
-							os.write(rdb);
-							os.flush();
-						} else if (cmd.equals("REPLCONF")) {
-							boolean sendOk = true;
-							if (command.size() > 2 && command.get(1).toUpperCase().equals("ACK")) {
-								long offset = Long.parseLong(command.get(2));
-								replicaOffsets.put(socket, offset);
-								sendOk = false;
-							}
-							if (sendOk) {
-								out.write("+OK\r\n");
-								out.flush();
-							}
-							if (command.size() > 2 && command.get(1).equalsIgnoreCase("listening-port")) {
-								replicaWriters.add(out);
-							}
-						} else if (cmd.equals("INFO")) {
-							if (command.get(1).equalsIgnoreCase("replication")) {
-								String role = isReplica ? "slave" : "master";
-								String infoRepl = "+role:" + role + "\r\n" + "+master_replid:" + master_replid + "\r\n" + "+master_repl_offset:" + master_repl_offset + "\r\n";
-								String resp = "$" + infoRepl.length() + "\r\n" + infoRepl + "\r\n";
-								socket.getOutputStream().write(resp.getBytes());
-								socket.getOutputStream().flush();
-							}
-						} else if (cmd.equals("MULTI")) {
-							multiHandler.init();
-							out.write("+OK\r\n");
-							out.flush();
-						} else if (cmd.equals("DISCARD")) {
-							if (!multiHandler.isOn()) {
-								out.write("-ERR DISCARD without MULTI\r\n");
-							} else {
-								multiHandler.clear();
-								out.write("+OK\r\n");
-							}
-							out.flush();
-						} else if (cmd.equals("EXEC")) {
-							if (!multiHandler.isOn()) {
-								out.write("-ERR EXEC without MULTI\r\n");
-								out.flush();
-							} else if (multiHandler.isEmpty()) {
-								multiHandler.clear();
-								out.write("*0\r\n");
-								out.flush();
-							} else {
-								out.write("*" + multiHandler.getSize() + "\r\n");
-								while (!multiHandler.isEmpty()) {
-									List<String> args = multiHandler.getNext();
-									String msg = execCommand(args, socket);
-									if (msg == null) {
-										throw new IOException("unknown command: " + command);
-									} else {
-										out.write(msg);
-									}
-								}
-								out.flush();
-								multiHandler.clear();
-							}
-						} else {
-							if (multiHandler.isOn()) {
-								multiHandler.add(command);
-								out.write("+QUEUED\r\n");
-								out.flush();
-							} else {
-								String msg = execCommand(command, socket);
-								if (msg == null) throw new IOException("unknown command: " + command);
-								out.write(msg);
-								out.flush();
-							}
-						}
-						if (writeCmds.contains(cmd)) {
-							String resp = getResp(command);
-							master_repl_offset += resp.getBytes().length;
-							for (BufferedWriter replicaOut : replicaWriters) {
-								replicaOut.write(resp);
-								replicaOut.flush();
-							}
-						}
-					}
-				}
-			} catch (IOException e) {
-				System.out.println("IOException: " + e.getMessage());
-			} finally {
-				replicaWriters.remove(out);
-				replicaOffsets.remove(socket);
-				try {
-					if (socket != null) {
-						socket.close();
-					}
-				} catch (IOException e) {
-					System.out.println("IOException: " + e.getMessage());
-				}
-			}
-		}
-	}
 }

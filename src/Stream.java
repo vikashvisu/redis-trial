@@ -75,15 +75,11 @@ public class Stream {
 		return binarySearchStartIndex(Utility.formatIdDouble(start), 0, n-1);
 	}
 
-	public String getNewEntries (int start, int count) {
+	public String getNewEntries (int start) {
 		int n = hashList.size();
-		int end = count == -1 ? n : start+count;
-		if (start >= n || end > n) return "";
-		System.out.println("start: " + start);
-		System.out.println("end: " + end);
-		System.out.println("n: " + n);
+		if (start >= n) return "";
 		String resp = "";
-		for (int i = start; i < end; i++) {
+		for (int i = start; i < n; i++) {
 			HashMap<String, String> hash = hashList.get(i);
 			String id = Utility.formatIdString(hash.get("id"));
 			resp += "$" + id.length() + "\r\n" + id + "\r\n";
