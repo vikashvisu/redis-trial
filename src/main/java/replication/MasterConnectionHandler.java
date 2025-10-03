@@ -1,6 +1,5 @@
 package replication;
 
-import config.Config;
 import execute.CommandExecutor;
 import parser.Parser;
 
@@ -12,16 +11,20 @@ import java.util.List;
 
 public class MasterConnectionHandler implements Runnable {
 
+	private final String masterHost;
+	private final int masterPort;
+	private final int replicaPort;
 	private long replica_repl_offset;
-	private final Config config;
 
-	public MasterConnectionHandler(Config config) {
-		this.config = config;
+	public MasterConnectionHandler(String masterHost, int masterPort, int replicaPort) {
+		this.masterHost = masterHost;
+		this.masterPort = masterPort;
+		this.replicaPort = replicaPort;
 		this.replica_repl_offset = 0;
 	}
 
 	public void run() {
-		try (Socket masterSocket = new Socket(config.getMasterHost(), config.getMasterPort());) {
+		try (Socket masterSocket = new Socket(masterHost, masterPort)) {
 			InputStream in = masterSocket.getInputStream();
 			OutputStream out = masterSocket.getOutputStream();
 			String resp = "*1\r\n$4\r\nPING\r\n";
@@ -33,7 +36,7 @@ public class MasterConnectionHandler implements Runnable {
 					"*3\r\n" +
 							"$8\r\nREPLCONF\r\n" +
 							"$14\r\nlistening-port\r\n" +
-							"$" + String.valueOf(config.getPort()).length() + "\r\n" + config.getPort() + "\r\n";
+							"$" + String.valueOf(replicaPort).length() + "\r\n" + replicaPort + "\r\n";
 			out.write(listeningPort.getBytes());
 			out.flush();
 			Parser.readLine(in);
@@ -73,7 +76,7 @@ public class MasterConnectionHandler implements Runnable {
 					out.write(ack.getBytes());
 					out.flush();
 				} else {
-					CommandExecutor.execute(command, null, null, null);
+					CommandExecutor.execute(command, null, null);
 				}
 				replica_repl_offset += Parser.getResp(command).getBytes().length;
 			}

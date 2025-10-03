@@ -1,19 +1,14 @@
 package list;
 
+import clients.ClientManager;
+
 import java.nio.channels.SelectionKey;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class RedisList {
 
 	private static final HashMap<String, LinkedList<ArrayList<String>>> lists = new HashMap<>();
-
-	public static LinkedList<ArrayList<String>> getList(String key) {
-		return lists.get(key);
-	}
 
 	public static HashMap<String, LinkedList<ArrayList<String>>> getLists() {
 		return lists;
@@ -38,6 +33,33 @@ public class RedisList {
 		}
 
 		int entryCount = getListSize(linkList);
+
+
+		ConcurrentHashMap<String, Queue<ListRequest>> listWaitQueue = ListWaitingQueueHandler.getListWaitQueue();
+		synchronized (listWaitQueue) {
+			Queue<ListRequest> pq = listWaitQueue.getOrDefault(key, null);
+			if (pq != null && !pq.isEmpty()) {
+				while (!pq.isEmpty()) {
+					ListRequest cr = pq.peek();
+					if (cr.getExpiryTime() != 0 && System.currentTimeMillis() >= cr.getExpiryTime()) {
+						pq.poll();
+						ClientManager.writeResponseToClient("$-1\r\n", cr.getKey());
+						cr.getKey().interestOps(SelectionKey.OP_READ);
+					} else {
+						pq.poll();
+						ArrayList<String> firstList = linkList.getFirst();
+						String removed = firstList.removeFirst();
+						if (firstList.isEmpty()) linkList.removeFirst();
+						if (linkList.isEmpty()) lists.remove(key);
+						String resp = "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
+						ClientManager.writeResponseToClient(resp, cr.getKey());
+						cr.getKey().interestOps(SelectionKey.OP_READ);
+						break;
+					}
+				}
+			}
+		}
+
 		return ":" + entryCount + "\r\n";
 
 	}
@@ -140,9 +162,11 @@ public class RedisList {
 			return "*2\r\n" + "$" + key.length() + "\r\n" + key + "\r\n" + "$" + removed.length() + "\r\n" + removed + "\r\n";
 		}
 
-		ConcurrentLinkedQueue<ListRequest> listWaitQueue = ListWaitingQueueHandler.getListWaitQueue();
+		ConcurrentHashMap<String, Queue<ListRequest>> listWaitQueue = ListWaitingQueueHandler.getListWaitQueue();
 		synchronized (listWaitQueue) {
-			listWaitQueue.offer(new ListRequest(selectKey, key, (long) expTime));
+			listWaitQueue.putIfAbsent(key, new LinkedList<>());
+
+			listWaitQueue.get(key).offer(new ListRequest(selectKey, (long) expTime));
 		}
 
 		selectKey.interestOps(0);
