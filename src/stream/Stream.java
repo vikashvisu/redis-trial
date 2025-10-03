@@ -1,9 +1,17 @@
+package stream;
+
+import utility.Utility;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 
 public class Stream {
 
-	private final ArrayList<HashMap<String, String>> hashList = new ArrayList<>();
+	private final ArrayList<HashMap<String, String>> hashList;
+
+	public Stream () {
+		hashList = new ArrayList<>();
+	}
 
 	public void add (HashMap<String, String> hash) {
 		hashList.add(hash);

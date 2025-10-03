@@ -1,3 +1,5 @@
+package zset;
+
 public class Geo {
 	private final double longitude;
 	private final double latitude;

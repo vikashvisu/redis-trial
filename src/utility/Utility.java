@@ -1,3 +1,7 @@
+package utility;
+
+import stream.Stream;
+
 public class Utility {
 
 	public static boolean validStreamID (String id, Stream stream) {
@@ -64,6 +68,23 @@ public class Utility {
 	public static String formatIdString (String id) {
 		String[] parts = id.split("\\.");
 		return parts[0] + "-" + parts[1];
+	}
+
+	public static boolean isInteger(String s) {
+		if (s == null) return false;
+		try {
+			Integer.parseInt(s);
+			return true;
+		} catch (NumberFormatException e) {
+			return false;
+		}
+	}
+
+	public static boolean isExpired(String val) {
+		if (Long.parseLong(val) == -1) return false;
+		long currentTime = System.currentTimeMillis();
+		if (currentTime >= Long.parseLong(val)) return true;
+		return false;
 	}
 
 

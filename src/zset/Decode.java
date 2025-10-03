@@ -1,3 +1,5 @@
+package zset;
+
 public class Decode {
 	private static final double MIN_LATITUDE = -85.05112878;
 	private static final double MAX_LATITUDE = 85.05112878;

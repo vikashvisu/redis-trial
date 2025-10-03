@@ -1,11 +1,15 @@
+package list;
+
 import java.nio.channels.SelectionKey;
 
-public class ClientRequest {
+public class ListRequest {
 	private final long expiryTime;
 	private final SelectionKey key;
+	private final String listKey;
 
-	ClientRequest(SelectionKey key, long expiryTime) {
+	ListRequest(SelectionKey key, String listKey, long expiryTime) {
 		this.key = key;
+		this.listKey = listKey;
 		this.expiryTime = expiryTime;
 	}
 
@@ -15,5 +19,9 @@ public class ClientRequest {
 
 	public long getExpiryTime() {
 		return expiryTime;
+	}
+
+	public String getListKey() {
+		return listKey;
 	}
 }
